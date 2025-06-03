@@ -405,7 +405,7 @@ if __name__ == '__main__':
 
     print(
         f"✅ CNN Standalone Test Accuracy: {correct_test}/{total_test} = {correct_test / total_test:.4f}")
-
+##
     test_softmax = []
     with torch.no_grad():
         for x, _ in testloader:
