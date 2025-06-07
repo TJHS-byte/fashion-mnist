@@ -1,19 +1,37 @@
-import os
 import gzip
+import os
 import struct
-import numpy as np
-import torch
+
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, TensorDataset, random_split
 from scipy.stats import binom
-from sklearn.neighbors import NearestNeighbors
+from torch.utils.data import Dataset, DataLoader, random_split
+
+from sklearn.decomposition import PCA
 
 CONFIDENCE_MODE = "SR"
 ACCEPTED_RISK = 0.01
-CONFIDENCE_LEVEL = 0.99
-MC_DROPOUT_PASSES = 30
+CONFIDENCE_LEVEL = 0.95
 BATCH_SIZE = 64
+
+import os
+import random
+import numpy as np
+import torch
+
+# ✅ Set a fixed seed
+SEED = 42
+
+# ✅ For `random`, `numpy`, and `torch`
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+# ✅ If using CUDA, ensure deterministic behavior
+torch.cuda.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 class CNN(nn.Module):
     def __init__(self):
@@ -29,132 +47,6 @@ class CNN(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-class PunchNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1), nn.ReLU(),
-            nn.Conv2d(16, 16, kernel_size=3, padding=1), nn.ReLU(),  # ← New layer
-            nn.Conv2d(16, 1, kernel_size=3, padding=1), nn.Tanh()     # Output perturbation ∈ [-1, 1]
-        )
-
-    def forward(self, x):
-        perturb = self.net(x)
-        return torch.clamp(perturb, -0.5, 0.5)
-
-
-def get_rejected_train_data(cnn, loader, threshold, mode = "SR"):
-    rejected_images, rejected_labels = [], []
-    cnn.eval()
-    with torch.no_grad():
-        for x, y in loader:
-            x = x.to(device)
-            logits = cnn(x)
-            probs = F.softmax(logits, dim = 1)
-            conf = torch.max(probs, dim = 1).values
-
-            for i in range(x.size(0)):
-                if conf[i].item() < threshold:
-                    rejected_images.append(x[i].cpu())
-                    rejected_labels.append(y[i])
-
-    return torch.stack(rejected_images), torch.tensor(rejected_labels)
-
-def get_rejected_and_disagreeing_train_data(cnn, loader, threshold, train_logits, train_labels, mode="SR"):
-    cnn.eval()
-    rejected_imgs, rejected_lbls = [], []
-
-    # Fit kNN on normalized logits
-    norm_logits = train_logits / np.linalg.norm(train_logits, axis=1, keepdims=True)
-    knn = NearestNeighbors(n_neighbors=15)
-    knn.fit(norm_logits)
-    count_selected = 0
-    with torch.no_grad():
-        idx_offset = 0
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            logits = cnn(x)
-            probs = F.softmax(logits, dim=1)
-            conf = torch.max(probs, dim=1).values
-            preds = torch.argmax(probs, dim=1)
-
-            for i in range(x.size(0)):
-                conf_i = conf[i].item()
-                pred_i = preds[i].item()
-                y_i = y[i].item()
-
-                logit_i = logits[i].cpu().numpy().reshape(1, -1)
-                logit_i = logit_i / np.linalg.norm(logit_i)
-                dists, indices = knn.kneighbors(logit_i)
-                neighbor_labels = train_labels[indices[0]]
-                knn_pred = np.bincount(neighbor_labels).argmax()
-
-                if conf_i < threshold and knn_pred != pred_i:
-                    rejected_imgs.append(x[i].cpu())
-                    rejected_lbls.append(y[i].cpu())
-                    count_selected += 1
-
-            idx_offset += x.size(0)
-        print(
-            f"✅ Selected {count_selected} training samples for PunchNet (CNN rejected + kNN disagrees)")
-    return torch.stack(rejected_imgs), torch.tensor(rejected_lbls)
-
-def train_punchnet(punchnet, cnn, images, labels, num_epochs=20, learning_rate=1e-3):
-    punchnet.train()
-    cnn.eval()
-
-    optimizer = torch.optim.Adam(punchnet.parameters(), lr=learning_rate, weight_decay=1e-4)
-    loss_fn = nn.CrossEntropyLoss()
-
-    dataset = TensorDataset(images, labels)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-
-    for epoch in range(num_epochs):
-        total_loss = 0
-        fixed = harmed = unchanged_correct = unchanged_incorrect = 0
-
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-
-            with torch.no_grad():
-                orig_logits = cnn(x)
-                orig_pred = torch.argmax(orig_logits, dim=1)
-
-            perturb = punchnet(x)
-            x_perturbed = torch.clamp(x + perturb, 0, 1)
-            logits = cnn(x_perturbed)
-            pred = torch.argmax(logits, dim=1)
-
-            # Main classification loss
-            loss = loss_fn(logits, y)
-
-            # Evaluation logic
-            cnn_wrong = (orig_pred != y)
-            unchanged = (pred == orig_pred)
-
-            fixed += ((cnn_wrong) & (pred == y)).sum().item()
-            harmed += ((~cnn_wrong) & (pred != y)).sum().item()
-            unchanged_correct += ((~cnn_wrong) & (unchanged)).sum().item()
-            unchanged_incorrect += ((cnn_wrong) & (unchanged)).sum().item()
-
-            # Regularization penalties
-            harm_penalty = harmed / x.size(0)
-            unchanged_penalty = unchanged_incorrect / x.size(0)
-
-            total = loss + 0.5 * harm_penalty + 0.5 * unchanged_penalty
-
-            optimizer.zero_grad()
-            total.backward()
-            optimizer.step()
-
-            total_loss += total.item()
-
-        if (epoch + 1) % 20 == 0 or epoch == num_epochs - 1:
-            print(f"\n[PunchNet Epoch {epoch+1}] Loss: {total_loss / len(loader):.4f}")
-            print(f"   🛠️ Fixed: {fixed}")
-            print(f"   ❌ Harmed: {harmed}")
-            print(f"   ➖ Correctly Unchanged: {unchanged_correct}")
-            print(f"   🔄 Incorrectly Unchanged: {unchanged_incorrect}")
 
 class FashionMNISTFromNumpy(Dataset):
     def __init__(self, images, labels):
@@ -205,28 +97,17 @@ def find_confidence_threshold(vecs, labels, preds, mode, accepted_risk, confiden
             best_threshold = sorted_data[z - 1][0]
     return best_threshold if best_threshold else sorted_data[-1][0]
 
-def hybrid_inference_with_knn_and_punchnet(cnn, punchnet, testloader, softmax_vectors, threshold, mode, train_logits, train_labels):
+def hybrid_inference_with_mlp(cnn, testloader, softmax_vectors, threshold, mode,
+                               pca, back_up_classifier, back_up_threshold):
+
     cnn.eval()
-    punchnet.eval()
 
     total = correct = 0
-    accepted = rejected = punched = 0
+    accepted = rejected = 0
     accepted_but_incorrect = 0
     rejected_but_correct = 0
 
-    cnn_knn_agree_correct = 0
-    cnn_knn_agree_incorrect = 0
-    punched_data_points = 0
-
-    disagreements_fixed = 0
-    disagreements_harmed = 0
-    disagreements_correctly_unchanged = 0
-    disagreements_incorrectly_unchanged = 0
-
-    # Prepare kNN
-    train_logits = train_logits / np.linalg.norm(train_logits, axis=1, keepdims=True)
-    knn = NearestNeighbors(n_neighbors=15)
-    knn.fit(train_logits)
+    fixed = harmed = unchanged_correct = unchanged_incorrect = 0
 
     for i, (x, y) in enumerate(testloader):
         x = x.to(device)
@@ -249,75 +130,57 @@ def hybrid_inference_with_knn_and_punchnet(cnn, punchnet, testloader, softmax_ve
             if cnn_pred == y:
                 rejected_but_correct += 1
 
-            # Run kNN
-            with torch.no_grad():
-                test_feat = cnn_logits.cpu().numpy().reshape(1, -1)
-                test_feat = test_feat / np.linalg.norm(test_feat, axis=1, keepdims=True)
-                dists, indices = knn.kneighbors(test_feat)
-                neighbor_labels = train_labels[indices[0]]
-                knn_pred = np.bincount(neighbor_labels).argmax()
+            # MLP on PCA-transformed image
+            test_img = x.cpu().numpy().reshape(1, -1)
+            norm_test_img = test_img / np.linalg.norm(test_img, axis=1, keepdims=True)
+            test_pca_feat = pca.transform(norm_test_img)
+            probs = back_up_classifier.predict_proba(test_pca_feat)[0]
+            pred = np.argmax(probs)
+            conf = np.max(probs)
 
-            if knn_pred == cnn_pred:
+            if conf >= back_up_threshold:
+                used_pred = pred
+            else:
+                used_pred = cnn_pred
+
+            if used_pred == cnn_pred:
                 if cnn_pred == y:
-                    cnn_knn_agree_correct += 1
+                    unchanged_correct += 1
                     correct += 1
                 else:
-                    cnn_knn_agree_incorrect += 1
+                    unchanged_incorrect += 1
             else:
-                # CNN and kNN disagree → use PunchNet
-                punched += 1
-                punched_data_points += 1
-                with torch.no_grad():
-                    perturb = punchnet(x)
-                    x_perturbed = torch.clamp(x + perturb, 0, 1)
-                    punch_pred = torch.argmax(cnn(x_perturbed)).item()
-
-                # Was CNN wrong before punching?
-                cnn_wrong = (cnn_pred != y)
-                # Is PunchNet prediction same as before?
-                unchanged = (punch_pred == cnn_pred)
-
-                if unchanged:
-                    if cnn_pred == y:
-                        disagreements_correctly_unchanged += 1
-                        correct += 1
-                    else:
-                        disagreements_incorrectly_unchanged += 1
-                else:
-                    if cnn_wrong and punch_pred == y:
-                        disagreements_fixed += 1
-                        correct += 1
-                    elif not cnn_wrong and punch_pred != y:
-                        disagreements_harmed += 1
-                    elif punch_pred == y:
-                        correct += 1
+                if used_pred == y and cnn_pred != y:
+                    fixed += 1
+                    correct += 1
+                elif used_pred != y and cnn_pred == y:
+                    harmed += 1
+                elif used_pred == y:
+                    correct += 1
 
     # ======= Dump Statistics =======
-    print("\n====================== Hybrid Model Performance Dump ======================")
-    print(f"🔎 Rejection Threshold Used: {threshold:.4f} | Confidence Mode: {mode}")
+    print("\n====================== Hybrid Model (MLP w/ Confidence Gate) ======================")
+    print(f"🔎 Rejection Threshold Used: {threshold:.4f} | CNN Confidence Mode: {mode}")
+    print(f"🔒 Backup Classifier Threshold: {back_up_threshold:.2f}")
     print(f"📌 Total Samples: {total}")
 
-    print(f"\n✅ Accepted by CNN: {accepted}")
+    print(f"\n✅ Accepted by Threshold: {accepted}")
     print(f"   ❌ Accepted but Incorrect: {accepted_but_incorrect}")
 
-    print(f"\n🚫 Rejected by CNN: {rejected}")
+    print(f"\n🚫 Rejected by Threshold: {rejected}")
     print(f"   ✅ Rejected but Correct: {rejected_but_correct}")
 
-    print(f"\n📊 CNN–kNN Agreement vs. Disagreement (on rejected samples):")
-    agreement_total = cnn_knn_agree_correct + cnn_knn_agree_incorrect
-    print(f"   🤝 Agreement Total: {agreement_total}")
-    print(f"      🔄 CNN Errors Missed by Agreement: {cnn_knn_agree_incorrect}")
-    print(f"   ⚡️ Disagreement Total (Sent to PunchNet): {punched_data_points}")
-
-    print(f"\n🧪 PunchNet Effect (on disagreements only):")
-    print(f"   🛠️ Fixed by PunchNet: {disagreements_fixed}")
-    print(f"   ❌ Harmed by PunchNet: {disagreements_harmed}")
-    print(f"   ➖ Correctly Unchanged: {disagreements_correctly_unchanged}")
-    print(f"   🔄 Incorrectly Unchanged: {disagreements_incorrectly_unchanged}")
+    print(f"\n🧪 MLP Effect on Rejected:")
+    print(f"   🛠️ Fixed by MLP: {fixed}")
+    print(f"   ❌ Harmed by MLP: {harmed}")
+    print(f"   ➖ Correctly Unchanged: {unchanged_correct}")
+    print(f"   🔄 Incorrectly Unchanged: {unchanged_incorrect}")
 
     print(f"\n📊 Final Accuracy:")
     print(f"   Correct: {correct}/{total} = {correct / total:.4f}")
     print("==========================================================================\n")
+
+
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -334,15 +197,24 @@ if __name__ == '__main__':
     full_train_dataset = FashionMNISTFromNumpy(X_tr, train_labels)
     test_dataset = FashionMNISTFromNumpy(X_te, test_labels)
 
-    train_dataset, val_dataset = random_split(full_train_dataset, [50000, 10000])
-    trainloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    from torch.utils.data import random_split
+
+
+    train_dataset, val_dataset = random_split(
+        full_train_dataset,
+        [50000, 10000],
+        generator = torch.Generator().manual_seed(SEED)  # ensure reproducible split
+    )
+    val_images_raw = X_tr[val_dataset.indices]
+    val_labels = np.array(train_labels)[val_dataset.indices]
+    trainloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, worker_init_fn=lambda _: np.random.seed(SEED))
     valloader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
     testloader = DataLoader(test_dataset, batch_size=1)
 
     cnn = CNN().to(device)
     opt = torch.optim.Adam(cnn.parameters(), lr=1e-3)
     loss_fn = nn.CrossEntropyLoss()
-    for epoch in range(20):
+    for epoch in range(1):
         cnn.train()
         total_loss = 0
         for x, y in trainloader:
@@ -369,27 +241,6 @@ if __name__ == '__main__':
             total_val += len(y)
     print(f"✅ CNN Validation Accuracy: {correct_val}/{total_val} = {correct_val / total_val:.4f}")
 
-    softmax_vectors = collect_softmax_vectors(cnn, valloader, CONFIDENCE_MODE)
-    threshold = find_confidence_threshold(softmax_vectors, val_labels, val_preds, CONFIDENCE_MODE, ACCEPTED_RISK, CONFIDENCE_LEVEL)
-    print(f"✅ Found Confidence Threshold: {threshold:.4f}")
-
-    logits_train = []
-    for x, _ in trainloader:
-        x = x.to(device)
-        with torch.no_grad():
-            logits = cnn(x).cpu().numpy()
-        logits_train.extend(logits)
-    train_logits = np.array(logits_train)
-    train_logits = train_logits / np.linalg.norm(train_logits, axis = 1, keepdims = True)
-    train_labels_array = train_labels[:len(train_logits)]
-
-    # Collect rejected training samples
-    rejected_images, rejected_labels = get_rejected_and_disagreeing_train_data(
-        cnn, trainloader, threshold, train_logits, train_labels_array, CONFIDENCE_MODE)
-    # Create and train PunchNet
-    punchnet = PunchNet().to(device)
-    train_punchnet(punchnet, cnn, rejected_images, rejected_labels, num_epochs = 100)
-
     # --------------------------
     # ✅ Standard CNN Test Accuracy
     # --------------------------
@@ -405,13 +256,91 @@ if __name__ == '__main__':
 
     print(
         f"✅ CNN Standalone Test Accuracy: {correct_test}/{total_test} = {correct_test / total_test:.4f}")
-##
+
+    softmax_vectors = collect_softmax_vectors(cnn, valloader, CONFIDENCE_MODE)
+    threshold = find_confidence_threshold(softmax_vectors, val_labels, val_preds, CONFIDENCE_MODE, ACCEPTED_RISK, CONFIDENCE_LEVEL)
+    print(f"✅ Found Confidence Threshold: {threshold:.4f}")
+
+    from sklearn.neural_network import MLPClassifier as SklearnMLP
+
+
+    # === Flatten and normalize all training images ===
+    flat_train_imgs = X_tr.reshape(len(X_tr), -1)
+    norm_flat_train_imgs = flat_train_imgs / np.linalg.norm(flat_train_imgs, axis = 1,
+                                                            keepdims = True)
+
+    # === Fit PCA on full training data ===
+    pca = PCA(n_components = 75)
+    train_pca_feats = pca.fit_transform(norm_flat_train_imgs)
+
+    # === Get CNN softmax vectors on training data ===
+    trainloader_eval = DataLoader(train_dataset, batch_size = BATCH_SIZE)
+    train_softmax_vectors = collect_softmax_vectors(cnn, trainloader_eval, CONFIDENCE_MODE)
+
+    # === Select rejected training points based on threshold ===
+    rejected_feats = []
+    rejected_labels = []
+
+    # Get corresponding labels from the original index (train_dataset.dataset = full_train_dataset)
+    true_train_labels = np.array(train_labels)[train_dataset.indices]
+
+    for v, conf_vec, label in zip(train_pca_feats[train_dataset.indices], train_softmax_vectors,
+                                  true_train_labels):
+        if compute_vector_confidence(conf_vec, CONFIDENCE_MODE) < threshold:
+            rejected_feats.append(v)
+            rejected_labels.append(label)
+
+    rejected_feats = np.array(rejected_feats)
+    rejected_labels = np.array(rejected_labels)
+
+    # === Prepare PCA features for validation set ===
+    flat_val_imgs = val_images_raw.reshape(len(val_images_raw), -1)
+    norm_flat_val_imgs = flat_val_imgs / np.linalg.norm(flat_val_imgs, axis = 1, keepdims = True)
+    val_pca_feats = pca.transform(norm_flat_val_imgs)
+
+    from sklearn.ensemble import RandomForestClassifier
+    print(f"Training Random Forest on {len(rejected_feats)} rejected samples")
+
+    # === Train Random Forest Classifier ===
+    rf_clf = RandomForestClassifier(
+        n_estimators = 300,  # Number of trees
+        max_depth = 45,  # Limit tree depth to avoid overfitting
+        random_state = 42,
+        n_jobs = -1  # Use all CPU cores
+    )
+    rf_clf.fit(rejected_feats, rejected_labels)
+
+
+
+    # === Get RF predicted probabilities and confidences ===
+    rf_val_probs = rf_clf.predict_proba(val_pca_feats)
+    rf_val_preds = np.argmax(rf_val_probs, axis = 1)
+    rf_val_confidences = np.max(rf_val_probs, axis = 1)
+
+    # === Compute confidence threshold for RF using same method ===
+    rf_conf_threshold = find_confidence_threshold(
+        vecs = rf_val_probs,
+        labels = val_labels,
+        preds = rf_val_preds,
+        mode = CONFIDENCE_MODE,
+        accepted_risk = 0.03,
+        confidence_level = 0.9
+    )
+    print(f"✅ Found Random Forest Confidence Threshold: {rf_conf_threshold:.4f}")
+
     test_softmax = []
     with torch.no_grad():
         for x, _ in testloader:
             x = x.to(device)
             out = F.softmax(cnn(x), dim=1)
             test_softmax.append(out.squeeze().cpu().numpy())
-    # Run the hybrid inference
-    hybrid_inference_with_knn_and_punchnet(cnn, punchnet, testloader, test_softmax, threshold,
-                                           CONFIDENCE_MODE, train_logits, train_labels_array)
+    hybrid_inference_with_mlp(
+        cnn = cnn,
+        testloader = testloader,
+        softmax_vectors = test_softmax,
+        threshold = threshold,
+        mode = CONFIDENCE_MODE,
+        pca = pca,
+        back_up_classifier = rf_clf,
+        back_up_threshold = rf_conf_threshold
+    )
