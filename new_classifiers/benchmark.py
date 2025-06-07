@@ -180,7 +180,7 @@ def hybrid_inference_with_mlp(cnn, testloader, softmax_vectors, threshold, mode,
     print(f"   Correct: {correct}/{total} = {correct / total:.4f}")
     print("==========================================================================\n")
 
-
+#
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
